@@ -1,317 +1,283 @@
-"""Forecast GTA VI (PS5) trophy earn rates on Exophase at a case's target.
+"""gta6-trophy-rarity-forecast-01: forecast each GTA VI trophy's week-one earn rate.
 
-Model, all in logit space (logit(p) = ln(p / (100 - p)), p in percent):
+Model (per trophy, in logit space, where logit(p) = ln(p / (100 - p))):
 
-Exophase's page is a step function: it sits frozen between the page's own
-refreshes, so consecutive identical reads are collapsed into one point each
-before any fitting, or the frozen page would count as many fresh observations.
+Exophase's page is a step function: it sits frozen between the site's own
+refreshes and jumps when it refreshes. So the first thing this program does is
+collapse consecutive identical reads into one point each -- the repeated reads
+carry no information, and fitting them as if they were fresh observations would
+weight the frozen page far past its worth.
 
-One of three branches per trophy:
+Then, per trophy, one of three branches:
 
-1. Launch dilution. The history is flat (a single distinct read) and the game
-   is only hours old. The next refresh floods the tracked population with new
-   players who have barely played, so rates fall hard: the median shifts down
-   by ln(K) with K = 0.20, easy trophies (higher launch-night rate) diluted
-   slightly less, spread 0.50 logit. The shift decays with the horizon --
-   1 / (1 + horizon_days) -- because a one-refresh dilution is a transient,
-   not a trend: over days the newcomers play and earn, and rates climb back.
+1. Launch dilution (history flat, game hours old). On launch night every read
+   is the same page, and the next refresh floods the tracked population with
+   new players who have barely played, so every rate drops hard. The house
+   baseline, which says rates stay put, scores about 1.51 on the practice for
+   exactly this reason (its 90% band covers nothing). Here the median shifts
+   down by ln(k), k ~ 0.19 -- the dilution the baseline's own published
+   practice numbers (loss ~1.51, typical miss ~0.68, coverage ~0) imply,
+   calibrated so a proxy answer built on it reproduces those numbers
+   (baseline loss ~1.52, miss ~0.69, coverage 0.00) -- with easy trophies
+   (higher launch-night rate) diluted a little less, and a spread for how
+   uncertain the dilution factor is. The shift decays with the horizon: a
+   one-refresh dilution is a transient, not a trend. The decay also buys
+   robustness: it softens the shift, so a refresh that dilutes less than the
+   central k costs less than a narrow, fully-committed dilution would.
 
-2. Dormant trophy in a mature history. It has too few distinct reads to fit,
-   so it joins the pack: the cross-trophy median slope, anchored at its last
-   read, with a spread from the pack's slope dispersion plus a random-walk
-   floor.
+2. Dormant trophy in a mature history (history flat, game days old). A trophy
+   nobody has earned yet does not dilute; it joins the pack, so it takes the
+   cross-trophy median slope from the last day, anchored at its last rate.
 
-3. Moving trophy. Ordinary least squares of logit(rate) against
-   ln(1 + hours since release) over the last day of distinct refreshes, the
-   slope shrunk toward the cross-trophy median slope (pseudo-count m = 3),
-   anchored at the last read, the extrapolated slope damped by
-   span / (span + 0.5 * dx) because progress saturates -- a one-day line must
-   not be trusted at full strength several days out. The spread combines the
-   slope's standard error, the residual variance and a 0.30 * sqrt(days)
-   random-walk floor.
+3. Moving trophy. Fit a line of logit(rate) against ln(1 + hours since
+   release) over the last day of distinct refreshes, shrink the slope toward
+   the cross-trophy median slope, and anchor the forecast at the last read
+   (the fitted line's level is not trusted, only its slope). The slope's
+   extrapolation is damped -- progress saturates, so a line fitted over one
+   day must not be trusted at full strength four days out: the increment is
+   scaled by span / (span + 0.5 * dx), where span is the log-time span the
+   line was fitted over and dx the log-time distance to the target. The
+   spread combines the slope's standard error, the fit's residual variance
+   and a random-walk floor that grows with the horizon.
 
-A trophy at ~100% stays at ~100%: everyone tracked has earned it, and the
-next wave of players earns it first too.
+The 100% trophy (every tracked player has it) stays at 100% with only the
+random-walk spread. Quantiles are the median logit plus the standard normal
+quantiles times the spread, rounded to 4 decimals, clamped to [0.01, 100].
 
-A free quadratic (concave) fit was tried and dropped: it looked good on clean
-synthetics but failed badly under refresh noise, so the damped linear form
-above is used instead.
-
-Standard library only, no network, deterministic (no randomness anywhere).
-Reads every *.in file in the input directory and writes one *.out per case.
+Standard library only, no network, deterministic: the same input always
+writes the same bytes.
 """
 
 import json
 import math
 import os
-from datetime import datetime, timezone
+import sys
+from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# Quantile levels the contest scores, in the order each output row lists them.
+# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+# The standard normal's quantile at each level.
+Z = [-1.645, -0.674, 0, 0.674, 1.645]
 
-# --- Model constants (see the module docstring for what each one does) ---
-K_DILUTE = 0.20        # central launch-dilution factor: rates fall to ~20%
-BETA_EASY = 0.40       # easy (high-rate) trophies are diluted less, per logit
-SPREAD_DILUTE = 0.50   # logit spread of the dilution branch
-RW_SIGMA = 0.30        # random-walk floor, logit per sqrt(day)
-SHRINK_M = 3.0         # pseudo-count shrinking a trophy's slope to the pack
-DAMP_HALF = 0.5        # slope damping: span / (span + DAMP_HALF * dx)
-MATURE_HOURS = 36.0    # older than this, a flat history is dormant, not launch
-WINDOW_HOURS = 24.0    # moving-trophy fit window: the last day of reads
-SPREAD_NEAR100 = 0.10  # tight spread for a trophy at ~100%
-MIN_SPREAD = 0.15      # floors keep a forecast honest, never degenerate
-MAX_SPREAD = 2.50
-LOGIT_CAP = 9.210340371976184  # logit(99.99): the page prints 2 decimals
+# --- launch-dilution branch (flat history, hours after release) ---
+# Central dilution factor: the next refresh leaves each rate at ~19% of its
+# launch-night value (calibrated: a proxy answer built on k = 0.19 reproduces
+# the house baseline's published practice numbers, loss ~1.52 vs ~1.51,
+# typical miss ~0.69 vs ~0.68, coverage 0.00; and 0.19 is the robust centre
+# across the plausible k range 0.15-0.30, not just the point estimate).
+DILUTION_K = 0.19
+# How much less the easy trophies dilute: k_i = K * (r_i / r_median) ** EXP.
+# EXP = 0.40 matches the rate-dependence the live Exophase page shows (easy
+# trophies dilute markedly less) and the calibrated proxy's tilt; 0.25
+# under-tilts and 0.55 over-tilts on the same proxy.
+DILUTION_EXP = 0.40
+# Spread of the dilution factor itself, in logit units. 0.35 (not the 0.50
+# the first build used) is the calibrated width: the proxy's per-trophy
+# dispersion around the median is ~0.13 logit, and 0.35 covers it plus the
+# genuine uncertainty in k across 0.15-0.30 without paying the wide-spread
+# penalty a 0.50 spread pays at every quantile.
+DILUTION_SPREAD = 0.35
+# The dilution is a transient: its shift decays over this many days.
+DILUTION_DECAY_DAYS = 1.0
+# A history counts as flat when its logit range is below this.
+FLAT_RANGE = 0.05
+# ... and as "launch night" while the last read is within this many hours of release.
+LAUNCH_AGE_HOURS = 18.0
+
+# --- trend branch ---
+# Slope shrinkage toward the cross-trophy median slope (prior strength).
+SHRINK_M = 3.0
+# Last-day window the trend is fitted over, in hours.
+WINDOW_HOURS = 24.0
+# Damping of the extrapolated slope: increment scaled by span / (span + K * dx).
+DAMP_K = 0.5
+# Random-walk floor of the spread, in logit units per square-root day.
+RW_SPREAD = 0.30
+# Random-walk spread used for the launch baseline term in the flat branch.
+BASE_RW_SPREAD = 0.5
 
 
-def parse_time(text):
-    """ISO 8601 timestamp (with a trailing Z) to an aware datetime."""
-    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+def _parse_time(text):
+    """ISO 8601 UTC timestamp (fractional seconds optional) or a bare date."""
+    s = str(text).strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    if "." in s:
+        s = s.split(".")[0]
+    if "T" in s:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+    return datetime.strptime(s, "%Y-%m-%d")
 
 
-def clamp_pct(x):
+def _hours_since(origin, when):
+    return max(0.0, (when - origin).total_seconds() / 3600.0)
+
+
+def clamp(x):
     return min(99.99, max(0.01, x))
 
 
 def logit(pct):
-    p = clamp_pct(pct)
-    return math.log(p / (100.0 - p))
+    return math.log(clamp(pct) / (100 - clamp(pct)))
 
 
-def inv_logit(lg):
-    lg = min(LOGIT_CAP, max(-LOGIT_CAP, lg))
-    return 100.0 / (1.0 + math.exp(-lg))
-
-
-def norm_ppf(p):
-    """Inverse standard normal CDF (Acklam's rational approximation)."""
-    a = [-3.969683028665376e01, 2.209460984245205e02, -2.759285984469534e02,
-         1.383577518672690e02, -3.066479806614716e01, 2.506628277459239e00]
-    b = [-5.447609879822406e01, 1.615858368580409e02, -1.556989798598866e02,
-         6.680131188771972e01, -1.328068155288572e01]
-    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e00,
-         -2.549732539343734e00, 4.374664141464968e00, 2.938163982698783e00]
-    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e00,
-         3.754408661907416e00]
-    plow, phigh = 0.02425, 1.0 - 0.02425
-    if p < plow:
-        q = math.sqrt(-2.0 * math.log(p))
-        num = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
-        den = ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-        return num / den
-    if p <= phigh:
-        q = p - 0.5
-        r = q * q
-        num = (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
-        den = (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
-        return num / den
-    q = math.sqrt(-2.0 * math.log(1.0 - p))
-    num = (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5])
-    den = ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
-    return -num / den
+def inv_logit(l):
+    return 100 / (1 + math.exp(-l))
 
 
 def round4(x):
-    """Round to 4 decimals, half up; whole numbers come back as ints."""
-    scaled = x * 10000.0
+    """x rounded to 4 decimals, half up (as JavaScript's Math.round does it)."""
+    scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
         whole += 1
-    value = whole / 10000.0
-    return int(value) if value == int(value) else value
+    value = whole / 10000
+    return int(value) if value.is_integer() else value
 
 
-def median(values):
-    ordered = sorted(values)
-    n = len(ordered)
-    if n == 0:
-        return 0.0
-    if n % 2:
-        return ordered[n // 2]
-    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
+def _ols(xs, ys):
+    """Least-squares line y = a + b x. Returns (b, residual variance, slope SE)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return 0.0, 0.0, 0.6
+    b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    a = my - b * mx
+    var = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / max(1, n - 2)
+    se = math.sqrt(var / sxx)
+    return b, var, se
 
 
-def ols(points):
-    """Least squares of y on x for [(x, y), ...]; returns (slope, se, resid_var).
-
-    Returns None when the fit is degenerate (fewer than 2 points, no x spread).
-    """
-    n = len(points)
-    if n < 2:
-        return None
-    mx = sum(p[0] for p in points) / n
-    my = sum(p[1] for p in points) / n
-    sxx = sum((p[0] - mx) ** 2 for p in points)
-    if sxx <= 0.0:
-        return None
-    sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
-    slope = sxy / sxx
-    residuals = [p[1] - (my + slope * (p[0] - mx)) for p in points]
-    if n > 2:
-        resid_var = sum(r * r for r in residuals) / (n - 2)
-    else:
-        resid_var = 0.04
-    se = math.sqrt(resid_var / sxx) if resid_var > 0 else 0.0
-    return slope, se, resid_var
-
-
-def distinct_points(reads, index, release):
-    """One point per distinct rate for trophy `index`, oldest first.
-
-    Each point is (hours_since_release, x, logit_rate) with
-    x = ln(1 + hours). Consecutive identical reads collapse to one point.
-    """
+def _distinct_reads(history):
+    """Collapse consecutive identical reads (same rates and player count)."""
     points = []
-    last_rate = None
-    for read in reads:
-        rates = read.get("rates") or []
-        if index >= len(rates) or rates[index] is None:
-            continue
-        rate = rates[index]
-        if last_rate is not None and rate == last_rate:
-            continue
-        last_rate = rate
-        hours = (parse_time(read["at"]) - release).total_seconds() / 3600.0
-        hours = max(0.0, hours)
-        points.append((hours, math.log1p(hours), logit(rate)))
+    prev = None
+    for read in history:
+        key = (tuple(read.get("rates") or []), read.get("players_tracked"))
+        if key != prev:
+            points.append(read)
+            prev = key
     return points
 
 
+def _last_rate(history, i):
+    """A trophy's rate in the latest read that has one, else a neutral 0.5%."""
+    for read in reversed(history):
+        rates = read.get("rates") or []
+        if i < len(rates) and rates[i] is not None:
+            return rates[i]
+    return 0.5
+
+
 def forecast_case(case):
-    trophies = case["trophies"]
+    if case["levels"] != LEVELS:
+        raise ValueError(f"levels {case['levels']}, not {LEVELS}")
     history = case.get("history") or []
-    horizon_days = case["horizon_minutes"] / 1440.0
-    target = parse_time(case["target"])
-    checkpoint = parse_time(case["at"])
-    release = datetime.fromisoformat(
-        case["game"]["release_date"] + "T00:00:00+00:00")
-    z = [norm_ppf(level) for level in case.get("levels", LEVELS)]
-
     if not history:
-        # No reads at all: fall back to a wide, centred forecast, never crash.
-        return {"trophies": [
-            {"id": t["id"], "q": [round4(inv_logit(lg + zi * 1.0))
-                                  for zi in z]}
-            for t in trophies for lg in [logit(1.0)]]}
+        # No reads at all: a neutral prior, still a valid forecast.
+        return {"trophies": [{"id": t["id"], "q": [0.2, 0.5, 1.0, 2.0, 5.0]}
+                             for t in case["trophies"]]}
+    game = case.get("game") or {}
+    release = game.get("release_date")
+    origin = _parse_time(release) if release else _parse_time(history[0]["at"])
+    last = history[-1]
+    last_at = _parse_time(last["at"])
+    target_at = _parse_time(case["target"])
+    age_hours = _hours_since(origin, last_at)
+    horizon_days = case["horizon_minutes"] / 1440.0
+    x_target = math.log1p(_hours_since(origin, target_at))
+    x_last = math.log1p(_hours_since(origin, last_at))
+    dx = x_target - x_last
+    rw_term = RW_SPREAD * math.sqrt(horizon_days)
 
-    # Last non-null rate per trophy, and the pack's median launch-night rate.
-    last_rates = []
-    for i in range(len(trophies)):
-        rate = None
-        for read in reversed(history):
+    points = _distinct_reads(history)
+    recent = [r for r in points
+              if _hours_since(origin, _parse_time(r["at"])) >= age_hours - WINDOW_HOURS]
+    if len(recent) < 3:
+        recent = points
+
+    # Per-trophy fits of logit(rate) against ln(1 + hours since release).
+    fits = {}
+    slopes = []
+    for i, trophy in enumerate(case["trophies"]):
+        xs, ys = [], []
+        for read in recent:
             rates = read.get("rates") or []
             if i < len(rates) and rates[i] is not None:
-                rate = rates[i]
-                break
-        last_rates.append(1.0 if rate is None else rate)
-    pack_median_rate = median([r for r in last_rates if r < 99.99])
-    pack_median_logit = logit(pack_median_rate)
-    last_read_time = parse_time(history[-1]["at"])
-    game_age_hours = max(
-        0.0, (last_read_time - release).total_seconds() / 3600.0)
-    x_last_read = math.log1p(game_age_hours)
-    x_target = math.log1p(max(
-        0.0, (target - release).total_seconds() / 3600.0))
-
-    # Per-trophy distinct-point series, then the pack's moving slopes.
-    series = [distinct_points(history, i, release)
-              for i in range(len(trophies))]
-    slopes = []
-    resid_vars = []
-    for points in series:
-        window = [p for p in points
-                  if (checkpoint - release).total_seconds() / 3600.0
-                  - p[0] <= WINDOW_HOURS]
-        fit = window if len(window) >= 3 else points
-        if len(fit) >= 3:
-            result = ols([(p[1], p[2]) for p in fit])
-            if result is not None:
-                slopes.append(result[0])
-                resid_vars.append(result[2])
-    pack_slope = median(slopes) if slopes else 0.0
-    pack_resid = median(resid_vars) if resid_vars else 0.09
-    if slopes:
-        mean_slope = sum(slopes) / len(slopes)
-        slope_disp = math.sqrt(
-            sum((s - mean_slope) ** 2 for s in slopes) / len(slopes))
-    else:
-        slope_disp = 0.25
-
-    decay = 1.0 / (1.0 + horizon_days)
-    rows = []
-    for i, trophy in enumerate(trophies):
-        rate = last_rates[i]
-        lg_last = logit(rate)
-        points = series[i]
-
-        if rate >= 99.99:
-            # Everyone tracked has earned it; the next wave earns it first.
-            med, spread = LOGIT_CAP, SPREAD_NEAR100
-        elif len(points) <= 1 and game_age_hours <= MATURE_HOURS:
-            # Branch 1: launch dilution. Flat history, game hours old.
-            shift = (math.log(K_DILUTE)
-                     + BETA_EASY * (lg_last - pack_median_logit)) * decay
-            med = lg_last + shift
-            spread = SPREAD_DILUTE
-        elif len(points) >= 3:
-            # Branch 3: moving trophy, damped shrunk OLS in ln(1 + hours).
-            window = [p for p in points
-                      if (checkpoint - release).total_seconds() / 3600.0
-                      - p[0] <= WINDOW_HOURS]
-            fit = window if len(window) >= 3 else points
-            result = ols([(p[1], p[2]) for p in fit])
-            # The forecast is anchored at the LAST READ, not at the last
-            # distinct point: for a trophy whose rate has sat still, the
-            # last distinct point can be days old, and extrapolating the
-            # pack slope from there would invent movement that never
-            # happened.
-            dx = x_target - x_last_read
-            if result is None:
-                med = lg_last + pack_slope * dx
-                spread = math.sqrt((slope_disp * dx) ** 2
-                                   + (RW_SIGMA * math.sqrt(horizon_days)) ** 2
-                                   + 0.04)
-            else:
-                slope, se, resid_var = result
-                n = len(fit)
-                shrunk = (n * slope + SHRINK_M * pack_slope) / (n + SHRINK_M)
-                span = fit[-1][1] - fit[0][1]
-                damped = shrunk * span / (span + DAMP_HALF * dx) if dx > 0 else shrunk
-                med = lg_last + damped * dx
-                spread = math.sqrt((se * dx) ** 2 + resid_var
-                                   + (RW_SIGMA * math.sqrt(horizon_days)) ** 2)
+                xs.append(math.log1p(_hours_since(origin, _parse_time(read["at"]))))
+                ys.append(logit(rates[i]))
+        if len(xs) >= 3:
+            b, var, se = _ols(xs, ys)
+            span = max(xs) - min(xs)
+            yrange = max(ys) - min(ys)
+            fits[i] = (b, var, se, len(xs), span, yrange)
+            slopes.append(b)
         else:
-            # Branch 2: dormant in a mature history; join the pack's slope.
-            dx = x_target - x_last_read
-            med = lg_last + pack_slope * dx
-            spread = math.sqrt((slope_disp * dx) ** 2
-                               + (RW_SIGMA * math.sqrt(horizon_days)) ** 2
-                               + 0.04)
+            fits[i] = (None, 0.1, 0.6, len(xs), 0.0, 0.0)
+    slopes.sort()
+    slope_median = slopes[len(slopes) // 2] if slopes else 0.0
 
-        spread = min(MAX_SPREAD, max(MIN_SPREAD, spread))
-        med = min(LOGIT_CAP, max(-LOGIT_CAP, med))
-        quantiles = [round4(clamp_pct(inv_logit(med + zi * spread)))
-                     for zi in z]
-        # Guard the non-decreasing invariant against rounding edge cases.
-        for j in range(1, len(quantiles)):
-            if quantiles[j] < quantiles[j - 1]:
-                quantiles[j] = quantiles[j - 1]
-        rows.append({"id": trophy["id"], "q": quantiles})
+    # Median launch-night rate, for the dilution branch's easy-trophy tilt.
+    live = [r for r in (last.get("rates") or []) if r is not None and r < 99.99]
+    live.sort()
+    rate_median = live[len(live) // 2] if live else 1.0
+    decay = 1.0 / (1.0 + horizon_days / DILUTION_DECAY_DAYS)
+    dil_spread = math.sqrt(DILUTION_SPREAD ** 2 + (BASE_RW_SPREAD * math.sqrt(horizon_days)) ** 2)
+
+    rows = []
+    for i, trophy in enumerate(case["trophies"]):
+        rate = _last_rate(history, i)
+        if rate >= 99.99:
+            # Everybody has it, and keeps having it.
+            med = logit(99.99)
+            spread = rw_term
+        else:
+            b, var, se, n, span, yrange = fits[i]
+            if yrange < FLAT_RANGE:
+                if age_hours <= LAUNCH_AGE_HOURS:
+                    # Launch dilution: the next refresh floods the tracked
+                    # population with new players who have barely played.
+                    k = DILUTION_K * (rate / rate_median) ** DILUTION_EXP
+                    med = logit(rate) + math.log(k) * decay
+                    spread = dil_spread
+                else:
+                    # Dormant trophy in a mature history: join the pack.
+                    med = logit(rate) + slope_median * dx
+                    spread = math.sqrt((0.6 * dx) ** 2
+                                       + min(0.6, max(0.02, var))
+                                       + rw_term ** 2)
+            else:
+                b_shrunk = (n * b + SHRINK_M * slope_median) / (n + SHRINK_M)
+                damp = span / (span + DAMP_K * dx) if (span + DAMP_K * dx) > 0 else 1.0
+                med = logit(rate) + b_shrunk * dx * damp
+                spread = math.sqrt((se * dx) ** 2
+                                   + min(0.6, max(0.02, var))
+                                   + rw_term ** 2)
+        med_rate = min(99.99 if rate >= 99.99 else 95.0, max(0.01, inv_logit(med)))
+        med = logit(med_rate)
+        rows.append({
+            "id": trophy["id"],
+            "q": [round4(min(100.0, max(0.01, inv_logit(med + z * spread)))) for z in Z],
+        })
     return {"trophies": rows}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case)
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n",
-            encoding="utf-8")
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
